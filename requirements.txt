@@ -1,0 +1,35 @@
+pytest
+pre-commit
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# SAM and segmentation
+segment-anything
+git+https://github.com/facebookresearch/segment-anything.git
+
+# COCO evaluation
+pycocotools>=2.0.6
+
+# RL libraries (depending on what you use)
+gymnasium>=0.29.0  # or gym
+stable-baselines3>=2.0.0  # if you use this
+
+# Data and visualization
+matplotlib>=3.7.0
+scikit-image>=0.21.0
+pandas>=2.0.0
+tqdm>=4.65.0
+
+# wandb>=0.15.0
+# sphinx
+# sphinx-rtd-theme
+# Sphinx-autodoc-typehints
+
+# Development tools (optional)
+pytest>=7.4.0
+jupyter>=1.0.0
