@@ -69,6 +69,7 @@ wandb/
 runs/
 results/
 outputs/
+scratch/
 
 # Temporary files
 *.swp
