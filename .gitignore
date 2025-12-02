@@ -37,6 +37,9 @@ env/
 # VS Code
 .vscode/
 
+# GitHub
+.gitignore
+
 # macOS
 .DS_Store
 .AppleDouble
