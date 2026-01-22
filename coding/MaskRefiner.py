@@ -4,47 +4,11 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 
 
-class AttentionGate(nn.Module):
-    """
-    Attention gate for skip connections.
-    Critical: Helps the network focus on relevant encoder features that SAM missed.
-    Without this, skip connections might propagate irrelevant information.
-    """
-
-    def __init__(self, gate_channels: int, skip_channels: int, inter_channels: Optional[int] = None):
-        super().__init__()
-        if inter_channels is None:
-            inter_channels = skip_channels // 2
-
-        self.W_gate = nn.Conv2d(gate_channels, inter_channels, kernel_size=1, stride=1, padding=0, bias=True)
-        self.W_skip = nn.Conv2d(skip_channels, inter_channels, kernel_size=1, stride=1, padding=0, bias=True)
-        self.psi = nn.Conv2d(inter_channels, 1, kernel_size=1, stride=1, padding=0, bias=True)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, gate: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            gate: Gating signal from decoder (lower resolution)
-            skip: Skip connection from encoder (higher resolution)
-        """
-        # Upsample gate to match skip resolution if needed
-        if gate.shape[2:] != skip.shape[2:]:
-            gate = F.interpolate(gate, size=skip.shape[2:], mode='bilinear', align_corners=False)
-
-        g = self.W_gate(gate)
-        s = self.W_skip(skip)
-        attention = self.sigmoid(self.psi(self.relu(g + s)))
-
-        return skip * attention
-
-
 class ConvBlock(nn.Module):
     """
     Double convolution block with normalization and residual connection.
-
     Critical choices:
-    - GroupNorm over BatchNorm: More stable with small batches (common in segmentation)
+    - GroupNorm over BatchNorm: More stable with small batches
     - Residual connections: Help gradient flow
     - Leaky ReLU: Prevents dead neurons
     """
@@ -83,94 +47,111 @@ class ConvBlock(nn.Module):
         return out
 
 
-class MaskRefinerUNet(nn.Module):
+class DecoderBlock(nn.Module):
     """
-    U-Net for refining SAM predictions.
+    Decoder block: Upsample + ConvBlock with optional mask feature fusion.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, use_mask_fusion: bool = True):
+        super().__init__()
+        self.use_mask_fusion = use_mask_fusion
+
+        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
+        self.norm = nn.GroupNorm(num_groups=min(32, out_channels), num_channels=out_channels)
+        self.activation = nn.LeakyReLU(0.1, inplace=True)
+
+        # If fusing with mask, input will be out_channels + mask_channels
+        conv_in_channels = out_channels + 1 if use_mask_fusion else out_channels
+        self.conv_block = ConvBlock(conv_in_channels, out_channels)
+
+    def forward(self, x: torch.Tensor, mask_feature: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.upsample(x)
+        x = self.norm(x)
+        x = self.activation(x)
+
+        # Fuse with mask features at this resolution if provided
+        if self.use_mask_fusion and mask_feature is not None:
+            # Ensure mask_feature matches spatial dimensions
+            if mask_feature.shape[2:] != x.shape[2:]:
+                mask_feature = F.interpolate(mask_feature, size=x.shape[2:], mode='bilinear', align_corners=False)
+            x = torch.cat([x, mask_feature], dim=1)
+
+        x = self.conv_block(x)
+        return x
+
+
+class MaskRefinerDecoder(nn.Module):
+    """
+    Decoder-only architecture for mask refinement.
 
     CRITICAL DESIGN PHILOSOPHY:
-    - This network learns SMALL CORRECTIONS, not mask regeneration
-    - Correction magnitude is constrained to prevent instability
-    - Multi-scale features are essential (SAM encoder has them, decoder might miss them)
-    - Boundary awareness is built-in through architecture
+    - No encoder needed - SAM embedding IS the encoded features
+    - Dual-path: semantic (embedding) and spatial (mask) processed separately
+    - Progressive upsampling with mask fusion at each scale
+    - Predicts CORRECTIONS, not full masks
 
     Args:
-        sam_feature_channels: Number of channels in SAM encoder feature
-        base_channels: Base number of channels (will be scaled up in deeper layers)
-        correction_scale: Maximum magnitude of correction (default: 0.3)
-        use_attention: Whether to use attention gates in skip connections
-        use_multi_scale: Whether to accept multi-scale SAM features
+        embed_channels: Channels in SAM embedding (768 for block 10)
+        base_channels: Base decoder channels (will decrease as we upsample)
+        num_upsample_stages: Number of 2x upsampling stages
+        correction_scale: Maximum magnitude of correction
+        use_mask_fusion: Fuse mask features at each decoder stage
+        dropout_rate: Dropout for regularization
     """
 
     def __init__(
             self,
-            sam_feature_channels: int = 256,  # SAM ViT-B uses 768, ViT-L uses 1024
-            base_channels: int = 64,
+            embed_channels: int = 768,
+            base_channels: int = 256,
+            num_upsample_stages: int = 5,  # 64->128->256->512->1024->2048
             correction_scale: float = 0.3,
-            use_attention: bool = True,
-            use_multi_scale: bool = False,
+            use_mask_fusion: bool = True,
             dropout_rate: float = 0.1
     ):
         super().__init__()
-
         self.correction_scale = correction_scale
-        self.use_attention = use_attention
-        self.use_multi_scale = use_multi_scale
+        self.num_upsample_stages = num_upsample_stages
+        self.use_mask_fusion = use_mask_fusion
 
-        # Input: concatenated [SAM feature, SAM mask]
-        input_channels = sam_feature_channels + 1  # +1 for mask channel
-
-        # Encoder (downsampling path)
-        self.enc1 = ConvBlock(input_channels, base_channels)
-        self.enc2 = ConvBlock(base_channels, base_channels * 2)
-        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
-        self.enc4 = ConvBlock(base_channels * 4, base_channels * 8)
-
-        # Bottleneck
-        self.bottleneck = ConvBlock(base_channels * 8, base_channels * 16)
-
-        # Decoder (upsampling path)
-        self.up4 = nn.ConvTranspose2d(base_channels * 16, base_channels * 8, kernel_size=2, stride=2)
-        self.dec4 = ConvBlock(base_channels * 16, base_channels * 8)  # *16 because of skip connection
-
-        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(base_channels * 8, base_channels * 4)
-
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(base_channels * 4, base_channels * 2)
-
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(base_channels * 2, base_channels)
-
-        # Attention gates (optional but recommended)
-        if use_attention:
-            self.att4 = AttentionGate(base_channels * 8, base_channels * 8)
-            self.att3 = AttentionGate(base_channels * 4, base_channels * 4)
-            self.att2 = AttentionGate(base_channels * 2, base_channels * 2)
-            self.att1 = AttentionGate(base_channels, base_channels)
-
-        # Pooling layers
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        # Dropout for regularization
-        self.dropout = nn.Dropout2d(p=dropout_rate)
-
-        # Final correction head
-        # CRITICAL: We predict correction, not final mask
-        self.correction_head = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=min(16, base_channels // 2), num_channels=base_channels // 2),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(base_channels // 2, 1, kernel_size=1),
-            nn.Tanh()  # Output in [-1, 1], will be scaled
+        # Project embedding to decoder base dimension
+        self.embed_proj = nn.Sequential(
+            nn.Conv2d(embed_channels, base_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=min(32, base_channels), num_channels=base_channels),
+            nn.LeakyReLU(0.1, inplace=True)
         )
 
-        # Optional: Boundary detection head (auxiliary task)
-        self.boundary_head = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=min(16, base_channels // 2), num_channels=base_channels // 2),
+        # Mask feature extractor (processes mask at multiple scales)
+        # This creates a parallel path that preserves spatial detail
+        self.mask_conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=8, num_channels=32),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(base_channels // 2, 1, kernel_size=1),
-            nn.Sigmoid()
+            nn.Conv2d(32, 1, kernel_size=3, padding=1, bias=False)
+        )
+
+        # Progressive decoder stages
+        self.decoder_stages = nn.ModuleList()
+        self.dropout_layers = nn.ModuleList()
+
+        channels = base_channels
+        for i in range(num_upsample_stages):
+            out_channels = max(channels // 2, 32)  # Don't go below 32 channels
+
+            self.decoder_stages.append(
+                DecoderBlock(channels, out_channels, use_mask_fusion=use_mask_fusion)
+            )
+            self.dropout_layers.append(nn.Dropout2d(p=dropout_rate))
+
+            channels = out_channels
+
+        # Final correction head
+        # CRITICAL: Small initialization for stable corrections
+        self.correction_head = nn.Sequential(
+            nn.Conv2d(channels, channels // 2, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=min(16, channels // 2), num_channels=channels // 2),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(channels // 2, 1, kernel_size=1),
+            nn.Tanh()  # Output in [-1, 1]
         )
 
         self._initialize_weights()
@@ -185,11 +166,11 @@ class MaskRefinerUNet(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.GroupNorm, nn.BatchNorm2d)):
+            elif isinstance(m, nn.GroupNorm):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-        # Initialize correction head with small weights
+        # Initialize correction head with VERY small weights
         for m in self.correction_head.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.normal_(m.weight, 0, 0.001)
@@ -198,86 +179,44 @@ class MaskRefinerUNet(nn.Module):
 
     def forward(
             self,
-            sam_feature: torch.Tensor,
-            sam_mask: torch.Tensor,
-            return_boundary: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            sam_embedding: torch.Tensor,  # [B, 64, 64, 768]
+            sam_mask: torch.Tensor,  # [B, 1, H, W] or [H, W]
+    ) -> torch.Tensor:
         """
         Forward pass.
 
         Args:
-            sam_feature: Feature from SAM encoder [B, C, H, W]
-            sam_mask: Predicted mask from SAM decoder [B, 1, H', W']
-            return_boundary: Whether to return boundary prediction
+            sam_embedding: SAM block 10 embedding [B, 64, 64, 768]
+            sam_mask: SAM predicted mask [B, 1, H, W] or [H, W]
 
         Returns:
-            refined_mask: Refined segmentation mask [B, 1, H', W']
-            boundary_pred: Optional boundary prediction [B, 1, H', W']
-
-        CRITICAL ASSUMPTIONS:
-        1. sam_mask should be in [0, 1] range (sigmoid output)
-        2. sam_feature and sam_mask might have different resolutions
-        3. Final output will match sam_mask resolution
+            refined_mask: Refined mask [B, 1, H, W]
         """
+        # Handle embedding dimension ordering
+        if sam_embedding.shape[-1] == 768:  # [B, H, W, C]
+            sam_embedding = sam_embedding.permute(0, 3, 1, 2)  # [B, C, H, W]
+
+        # Handle mask dimensions
+        if sam_mask.dim() == 2:
+            sam_mask = sam_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        elif sam_mask.dim() == 3:
+            sam_mask = sam_mask.unsqueeze(1)  # [B, 1, H, W]
+
         original_mask_size = sam_mask.shape[2:]
 
-        # Resize SAM mask to match feature map if needed
-        if sam_mask.shape[2:] != sam_feature.shape[2:]:
-            sam_mask_resized = F.interpolate(
-                sam_mask,
-                size=sam_feature.shape[2:],
-                mode='bilinear',
-                align_corners=False
-            )
-        else:
-            sam_mask_resized = sam_mask
+        # Project embedding to decoder dimension
+        x = self.embed_proj(sam_embedding)  # [B, base_channels, 64, 64]
 
-        # Concatenate feature and mask
-        x = torch.cat([sam_feature, sam_mask_resized], dim=1)
+        # Extract mask features (this preserves spatial information)
+        mask_features = self.mask_conv(sam_mask)  # [B, 1, H, W]
 
-        # Encoder with skip connections
-        enc1 = self.enc1(x)
-        enc2 = self.enc2(self.pool(enc1))
-        enc2 = self.dropout(enc2)
-
-        enc3 = self.enc3(self.pool(enc2))
-        enc3 = self.dropout(enc3)
-
-        enc4 = self.enc4(self.pool(enc3))
-        enc4 = self.dropout(enc4)
-
-        # Bottleneck
-        bottleneck = self.bottleneck(self.pool(enc4))
-        bottleneck = self.dropout(bottleneck)
-
-        # Decoder with skip connections and optional attention
-        dec4 = self.up4(bottleneck)
-        if self.use_attention:
-            enc4 = self.att4(dec4, enc4)
-        dec4 = torch.cat([dec4, enc4], dim=1)
-        dec4 = self.dec4(dec4)
-
-        dec3 = self.up3(dec4)
-        if self.use_attention:
-            enc3 = self.att3(dec3, enc3)
-        dec3 = torch.cat([dec3, enc3], dim=1)
-        dec3 = self.dec3(dec3)
-
-        dec2 = self.up2(dec3)
-        if self.use_attention:
-            enc2 = self.att2(dec2, enc2)
-        dec2 = torch.cat([dec2, enc2], dim=1)
-        dec2 = self.dec2(dec2)
-
-        dec1 = self.up1(dec2)
-        if self.use_attention:
-            enc1 = self.att1(dec1, enc1)
-        dec1 = torch.cat([dec1, enc1], dim=1)
-        dec1 = self.dec1(dec1)
+        # Progressive upsampling with mask fusion
+        for i, (decoder_stage, dropout) in enumerate(zip(self.decoder_stages, self.dropout_layers)):
+            x = decoder_stage(x, mask_features if self.use_mask_fusion else None)
+            x = dropout(x)
 
         # Predict correction
-        correction = self.correction_head(dec1)
-        correction = correction * self.correction_scale  # Scale to [-correction_scale, +correction_scale]
+        correction = self.correction_head(x)  # [B, 1, current_size, current_size]
 
         # Resize correction to match original mask size
         if correction.shape[2:] != original_mask_size:
@@ -288,8 +227,8 @@ class MaskRefinerUNet(nn.Module):
                 align_corners=False
             )
 
-        # Apply correction with clamping
-        # CRITICAL: Clamp to [0, 1] to ensure valid probability mask
+        # Scale correction and apply with clamping
+        correction = correction * self.correction_scale
         refined_mask = torch.clamp(sam_mask + correction, 0.0, 1.0)
 
-        return refined_mask
+        return refined_mask.contiguous()
